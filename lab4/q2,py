@@ -1,0 +1,132 @@
+import sympy
+import base64
+import time
+import sqlite3
+from flask import Flask, request, jsonify
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
+
+# Helper functions to generate Rabin keys
+def generate_rabin_keypair(key_size):
+    p = sympy.nextprime(sympy.randprime(2**(key_size//2 - 1), 2**(key_size//2)))
+    q = sympy.nextprime(sympy.randprime(2**(key_size//2 - 1), 2**(key_size//2)))
+    n = p * q
+    return p, q, n
+
+def rabin_encrypt(public_key, plaintext):
+    n = public_key
+    message = int.from_bytes(plaintext.encode(), byteorder='big')
+    ciphertext = pow(message, 2, n)
+    return ciphertext
+
+def rabin_decrypt(private_keys, ciphertext):
+    p, q, n = private_keys
+    mp = pow(ciphertext, (p + 1) // 4, p)
+    mq = pow(ciphertext, (q + 1) // 4, q)
+    x1 = sympy.mod_inverse(p, q) * (mp - mq) % q
+    x2 = sympy.mod_inverse(q, p) * (mq - mp) % p
+    return (x1 % n).to_bytes((x1.bit_length() + 7) // 8, byteorder='big').decode()
+
+# Key Management System
+DATABASE = 'key_management.db'
+
+def init_db():
+    with sqlite3.connect(DATABASE) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS keys
+                        (id INTEGER PRIMARY KEY,
+                         hospital_name TEXT UNIQUE,
+                         public_key BLOB,
+                         private_key BLOB,
+                         created_at TIMESTAMP,
+                         updated_at TIMESTAMP)''')
+        conn.commit()
+
+def generate_key_entry(hospital_name, public_key, private_key):
+    with sqlite3.connect(DATABASE) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO keys (hospital_name, public_key, private_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (hospital_name, public_key, private_key, int(time.time()), int(time.time())))
+        conn.commit()
+
+def get_key_entry(hospital_name):
+    with sqlite3.connect(DATABASE) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT public_key, private_key FROM keys WHERE hospital_name=?", (hospital_name,))
+        return cur.fetchone()
+
+def revoke_key_entry(hospital_name):
+    with sqlite3.connect(DATABASE) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM keys WHERE hospital_name=?", (hospital_name,))
+        conn.commit()
+
+@app.route('/generate_key', methods=['POST'])
+def generate_key():
+    data = request.json
+    hospital_name = data['hospital_name']
+    key_size = data.get('key_size', 1024)
+    p, q, n = generate_rabin_keypair(key_size)
+    public_key = base64.b64encode(n.to_bytes((n.bit_length() + 7) // 8, byteorder='big'))
+    private_key = base64.b64encode(p.to_bytes((p.bit_length() + 7) // 8, byteorder='big') + q.to_bytes((q.bit_length() + 7) // 8, byteorder='big'))
+    generate_key_entry(hospital_name, public_key, private_key)
+    return jsonify({'public_key': public_key.decode(), 'private_key': private_key.decode()})
+
+@app.route('/get_key', methods=['GET'])
+def get_key():
+    hospital_name = request.args.get('hospital_name')
+    keys = get_key_entry(hospital_name)
+    if keys:
+        public_key, private_key = keys
+        return jsonify({'public_key': base64.b64encode(public_key).decode(), 'private_key': base64.b64encode(private_key).decode()})
+    else:
+        return jsonify({'error': 'Key not found'}), 404
+
+@app.route('/revoke_key', methods=['POST'])
+def revoke_key():
+    data = request.json
+    hospital_name = data['hospital_name']
+    revoke_key_entry(hospital_name)
+    return jsonify({'status': 'Key revoked'})
+
+@app.route('/encrypt', methods=['POST'])
+def encrypt_message():
+    data = request.json
+    hospital_name = data['hospital_name']
+    message = data['message']
+    keys = get_key_entry(hospital_name)
+    if keys:
+        _, private_key = keys
+        private_key = base64.b64decode(private_key)
+        p = int.from_bytes(private_key[:len(private_key)//2], byteorder='big')
+        q = int.from_bytes(private_key[len(private_key)//2:], byteorder='big')
+        n = p * q
+        ciphertext = rabin_encrypt(n, message)
+        return jsonify({'ciphertext': str(ciphertext)})
+    else:
+        return jsonify({'error': 'Key not found'}), 404
+
+@app.route('/decrypt', methods=['POST'])
+def decrypt_message():
+    data = request.json
+    hospital_name = data['hospital_name']
+    ciphertext = int(data['ciphertext'])
+    keys = get_key_entry(hospital_name)
+    if keys:
+        private_key = keys[1]
+        private_key = base64.b64decode(private_key)
+        p = int.from_bytes(private_key[:len(private_key)//2], byteorder='big')
+        q = int.from_bytes(private_key[len(private_key)//2:], byteorder='big')
+        n = p * q
+        message = rabin_decrypt((p, q, n), ciphertext)
+        return jsonify({'message': message})
+    else:
+        return jsonify({'error': 'Key not found'}), 404
+
+if __name__ == "__main__":
+    init_db()
+    app.run(port=5000)
